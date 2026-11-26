@@ -1,26 +1,35 @@
-import crypto from "crypto";
 import { cookies } from "next/headers";
+import { connection } from "next/server";
+import crypto from "node:crypto";
 
 const COOKIE_NAME = "laporku_admin_session";
 
 function getSessionSecret(): string {
   const secret = process.env.SESSION_SECRET;
   if (!secret || secret.length < 16) {
-    throw new Error("SESSION_SECRET belum diatur atau terlalu pendek.");
+    throw new Error(
+      "SESSION_SECRET harus diisi minimal 16 karakter di environment.",
+    );
   }
   return secret;
 }
 
-function signValue(payload: string, secret: string): string {
-  return crypto.createHmac("sha256", secret).update(payload).digest("hex");
+function signPayload(payloadB64: string, secret: string): string {
+  return crypto
+    .createHmac("sha256", secret)
+    .update(payloadB64)
+    .digest("base64url");
 }
 
-export function createSessionToken(): string {
-  const payload = Buffer.from(
-    JSON.stringify({ role: "admin", exp: Date.now() + 1000 * 60 * 60 * 12 }),
-  ).toString("base64url");
-  const sig = signValue(payload, getSessionSecret());
-  return `${payload}.${sig}`;
+export function createSessionToken(maxAgeSeconds = 60 * 60 * 24): string {
+  const secret = getSessionSecret();
+  const payload = {
+    role: "admin",
+    exp: Date.now() + maxAgeSeconds * 1000,
+  };
+  const payloadB64 = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const sig = signPayload(payloadB64, secret);
+  return `${payloadB64}.${sig}`;
 }
 
 export function verifySessionToken(token: string | undefined): boolean {
@@ -28,18 +37,23 @@ export function verifySessionToken(token: string | undefined): boolean {
   const parts = token.split(".");
   if (parts.length !== 2) return false;
 
-  const [payload, sig] = parts;
-  const expectedSig = signValue(payload, getSessionSecret());
-
-  const sigBuf = Buffer.from(sig);
-  const expectedBuf = Buffer.from(expectedSig);
-  if (sigBuf.length !== expectedBuf.length) return false;
-  if (!crypto.timingSafeEqual(sigBuf, expectedBuf)) return false;
+  const [payloadB64, sig] = parts;
+  if (!payloadB64 || !sig) return false;
 
   try {
+    const secret = getSessionSecret();
+    const expectedSig = signPayload(payloadB64, secret);
+    const sigBuf = Buffer.from(sig);
+    const expBuf = Buffer.from(expectedSig);
+    if (sigBuf.length !== expBuf.length) return false;
+    if (!crypto.timingSafeEqual(sigBuf, expBuf)) return false;
+
     const parsed = JSON.parse(
-      Buffer.from(payload, "base64url").toString("utf8"),
-    );
+      Buffer.from(payloadB64, "base64url").toString("utf8"),
+    ) as {
+      role?: string;
+      exp?: number;
+    };
     return (
       parsed.role === "admin" &&
       typeof parsed.exp === "number" &&
@@ -51,6 +65,7 @@ export function verifySessionToken(token: string | undefined): boolean {
 }
 
 export async function isAdminAuthenticated(): Promise<boolean> {
+  await connection();
   const cookieStore = await cookies();
   const token = cookieStore.get(COOKIE_NAME)?.value;
   return verifySessionToken(token);
